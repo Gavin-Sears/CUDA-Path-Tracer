@@ -1,3 +1,4 @@
+#include "denoise.h"
 #include "glslUtility.hpp"
 #include "image.h"
 #include "pathtrace.h"
@@ -362,6 +363,18 @@ void RenderImGui()
         ImGui::TextColored(ImVec4(0.8f, 0.1f, 0.1f, 1.0f), "BVH off: big meshes take many seconds per iteration");
     }
     ImGui::Checkbox("Sort paths by material", &imguiData->sortByMaterial);
+    if (ImGui::Checkbox("MIS + NEE (light sampling)", &imguiData->useMIS))
+    {
+        camchanged = true;
+    }
+    if (denoiserAvailable())
+    {
+        ImGui::Checkbox("Denoise (OIDN)", &imguiData->denoise);
+    }
+    else
+    {
+        ImGui::TextDisabled("Denoiser unavailable (OIDN not found)");
+    }
     if (ImGui::Checkbox("Visualize BVH", &imguiData->visualizeBVH))
     {
         camchanged = true;

@@ -50,6 +50,14 @@ set(GLM_ROOT_DIR "${CMAKE_SOURCE_DIR}/external")
 find_package(GLM REQUIRED)
 include_directories(${GLM_INCLUDE_DIRS})
 
+set(OIDN_ROOT "${CMAKE_SOURCE_DIR}/external/oidn" CACHE PATH "Open Image Denoise package (contains lib/cmake/OpenImageDenoise-*)")
+find_package(OpenImageDenoise 2.0 CONFIG QUIET HINTS "${OIDN_ROOT}")
+if(OpenImageDenoise_FOUND)
+    message(STATUS "Open Image Denoise found: denoiser enabled")
+else()
+    message(STATUS "Open Image Denoise not found (OIDN_ROOT=${OIDN_ROOT}): building without the denoiser")
+endif()
+
 set(headers
     src/image.h
     src/interactions.h
@@ -63,6 +71,7 @@ set(headers
     external/include/tiny_gltf_v3.h
     external/include/tinygltf_json_c.h
     src/bvh.h
+    src/denoise.h
 )
 
 set(sources
@@ -78,6 +87,7 @@ set(sources
     src/mesh.cpp
     external/include/tiny_gltf_v3.c
     src/bvh.cpp
+    src/denoise.cpp
 )
 
 set(imgui_headers
@@ -121,6 +131,18 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     ${GL_LIBRARIES}
     #stream_compaction  # TODO: uncomment if using your stream compaction
 )
+if(OpenImageDenoise_FOUND)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE USE_OIDN)
+    target_link_libraries(${CMAKE_PROJECT_NAME} OpenImageDenoise)
+    if(WIN32)
+        get_filename_component(OIDN_BIN_DIR "${OpenImageDenoise_DIR}/../../../bin" ABSOLUTE)
+        foreach(dll OpenImageDenoise OpenImageDenoise_core OpenImageDenoise_device_cpu OpenImageDenoise_device_cuda tbb12)
+            add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${OIDN_BIN_DIR}/${dll}.dll" "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>")
+        endforeach()
+    endif()
+endif()
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES CUDA_ARCHITECTURES native)
 

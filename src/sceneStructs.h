@@ -91,6 +91,9 @@ struct PathSegment
     glm::vec3 color;
     int pixelIndex;
     int remainingBounces;
+    // whether or not we hit a specular material. Used for MIS
+    bool specularBounce;   // true if the last scatter was a delta BSDF (mirror/glass), or this is the camera ray
+    float bsdfPdf;         // solid-angle pdf of the direction just BSDF-sampled (only meaningful when !specularBounce)
 };
 
 // Use with a corresponding PathSegment to do:
@@ -101,4 +104,6 @@ struct ShadeableIntersection
   float t;
   glm::vec3 surfaceNormal;
   int materialId;
+  bool outside;
+  int geomId;
 };

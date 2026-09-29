@@ -89,7 +89,34 @@ The red pixels very close to the mesh have the most traversals. That is because 
 
 I think the biggest optimization I could add to this BVH implementation would be the addition of SAH splitting to prevent more of the red spots that we see in the heatmap.
 
+### Denoising (OIDN)
+
+<table border="0">
+  <tr>
+    <td><img src="img/refraction_noisy.png" width="300" alt="cornell box with refractive material sphere, no denoising"></td>
+    <td><img src="img/refraction_denoise.png" width="300" alt="cornell box with refractive material sphere, denoised"></td>
+  </tr>
+  <tr align="center">
+    <td><b>No Denoising (500 iterations)</b></td>
+    <td><b>OIDN denoiser (500 iterations)</b></td>
+  </tr>
+</table>
+
+### Mirror Surfaces (specular)
+
+![Sphere, cube, and bunny with reflection in cornell box. Image is denoised](img/specular_showcase.png)
+
+### Refractive Materials
+
+![Sphere, cube, and bunny with refraction in cornell box. Image is denoised](img/refraction_showcase.png)
+
+### MIS + NEE
+
+*Performance analysis/visual comparison coming soon*
+
 ### UI customization
+
+*This section will be updated once more features have been added*
 
 ![Custom UI controls for the renderer. Includes start/stop render, toggling bvh debugging features, iterations, traced depth, toggling vsync](img/UI.png)
 
@@ -100,10 +127,8 @@ Some quality of life testing tools, like stopping and starting the render, toggl
 ![A cornell box with the stanford bunny inside. This bunny has a very strange shadow.](img/funnybunnyshadow.png)
 
 This scene appears to be normal, except that the shadow of the bunny has strange holes in it. For a while I was thinking this could be an issue with my BVH, but my non-bvh version also had this issue.
-I threw the bunny into Blender to decimate it or subdivide it to see if the geometry density was the issue, and... there were holes in the bottom of the mesh which made it non manifold. It turns out that rays were shooting out of the camera, hitting the ground, bouncing up, going through the bunny, and then going through the backfaces (I use glm::intersectRayTriangle, which backface culls). From there the rays were finding the light, and so the floor got illuminated in those spots. I filled the holes in Blender, and that solved it.
+I threw the bunny into Blender to decimate it or subdivide it to see if the geometry density was the issue, and... there were holes in the bottom of the mesh which made it non manifold. It turns out that rays were shooting out of the camera, hitting the ground, bouncing up, going through the bunny, and then going through the backfaces (I was using glm::intersectRayTriangle at the time, which backface culls). From there the rays were finding the light, and so the floor got illuminated in those spots. I filled the holes in Blender, and that solved it.
 
-### CHANGED CmakeLists.txt:
+![A sphere in a cornell box that looks like a ball bearing with a distorted reflection.](img/outtake_refraction_epsilon.png)
 
-I added mesh.h to headers and mesh.cpp to sources for mesh loading.
-I also added bvh.h and bvh.cpp to headers and sources for bvh.
-Additionally, I added C compile options (for tiny gltf) and changed the preprocessor.
+Looks like a regular specular surface, right? What if I told you this was supposed to be a refractive object... In my scatterRay function (where we calculate the new direction for a ray bouncing around the scene), the hit point passed into the function was pulled back by a small epsilon so that the ray didn't hit the object more than once. I originally offset the ray along the normal by a small epsilon within the function as well, with a sign that depended on whether the ray reflected or refracted. Because of this, the offsets would cancel each other out with refracted rays, and the rays were repeatedly bouncing on the surface of the object. In order to fix this, the exact point was passed into scatterRay instead of the pulled back one. The epsilon value was also changed to be higher.

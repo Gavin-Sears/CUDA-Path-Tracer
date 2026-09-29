@@ -14,5 +14,6 @@ public:
     std::vector<Material> materials;
     std::vector<Triangle> triangles;
     std::vector<BVHNode> bvhNodes;
+    std::vector<int> lightGeomIndices;
     RenderState state;
 };

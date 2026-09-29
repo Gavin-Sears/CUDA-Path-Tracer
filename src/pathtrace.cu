@@ -16,6 +16,7 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+#include "denoise.h"
 
 #define BVH_STACK_SIZE 64
 
@@ -90,9 +91,30 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
     }
 }
 
+__global__ void scaleImage(int n, const glm::vec3* in, glm::vec3* out, float scale)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        out[idx] = in[idx] * scale;
+    }
+}
+
 static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
+
+// albedo (non-lit colors) in range [0, 1]
+static glm::vec3* dev_albedo = NULL;
+// normals in range [-1, 1]
+static glm::vec3* dev_normal = NULL;
+
+// image sent to denoiser, also output
+static glm::vec3* dev_denoise = NULL;
+
+// true if last frame sent to screen was denoised
+static bool showingDenoised = false;
+
 static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static Triangle* dev_triangles = NULL;
@@ -102,9 +124,14 @@ static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
+// indices in dev_geoms of every light for NEE
+static int* dev_lightGeomIndices = NULL;
+static int numLights = 0;
+
 // Timing for the GUI
 static cudaEvent_t evStart = NULL;
 static cudaEvent_t evStop = NULL;
+
 
 // Arrays that we use for final gather with radix sort.
 static PathSegment* dev_paths_sorted = NULL;
@@ -242,11 +269,38 @@ void pathtraceInit(Scene* scene)
     cudaEventCreate(&evStart);
     cudaEventCreate(&evStop);
 
+    cudaMalloc(&dev_albedo, pixelcount * sizeof(glm::vec3));
+    cudaMalloc(&dev_normal, pixelcount * sizeof(glm::vec3));
+    cudaMalloc(&dev_denoise, pixelcount * sizeof(glm::vec3));
+    cudaMemset(dev_albedo, 0, pixelcount * sizeof(glm::vec3));
+    cudaMemset(dev_normal, 0, pixelcount * sizeof(glm::vec3));
+    cudaMemset(dev_denoise, 0, pixelcount * sizeof(glm::vec3));
+    // Does nothing if OIDN wasn't found when building
+    denoiserInit(cam.resolution.x, cam.resolution.y,
+        (float*)dev_denoise, (float*)dev_albedo, (float*)dev_normal, (float*)dev_denoise);
+
+    // Upload the light list for NEE. We do at least one element with cudaMalloc to avoid issues with using the pointer later.
+    numLights = (int)scene->lightGeomIndices.size();
+    cudaMalloc(&dev_lightGeomIndices, (numLights > 0 ? numLights : 1) * sizeof(int));
+    if (numLights > 0)
+    {
+        cudaMemcpy(dev_lightGeomIndices, scene->lightGeomIndices.data(), numLights * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
     checkCUDAError("pathtraceInit");
 }
 
 void pathtraceFree()
 {
+    denoiserFree();
+    cudaFree(dev_albedo);
+    cudaFree(dev_normal);
+    cudaFree(dev_denoise);
+    dev_albedo = dev_normal = dev_denoise = NULL;
+    showingDenoised = false;
+    cudaFree(dev_lightGeomIndices);
+    dev_lightGeomIndices = NULL;
+    numLights = 0;
     cudaFree(dev_image);  // no-op if dev_image is null
     cudaFree(dev_paths);
     cudaFree(dev_geoms);
@@ -293,7 +347,8 @@ void pathtraceCopyImageToHost()
 
     const Camera& cam = hst_scene->state.camera;
     const int pixelcount = cam.resolution.x * cam.resolution.y;
-    cudaMemcpy(hst_scene->state.image.data(), dev_image,
+    // Saves what is on screen: the denoised image if the denoiser is on. Both are running sums.
+    cudaMemcpy(hst_scene->state.image.data(), showingDenoised ? dev_denoise : dev_image,
         pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 
     checkCUDAError("pathtraceCopyImageToHost");
@@ -315,13 +370,13 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
     if (x < cam.resolution.x && y < cam.resolution.y) {
         int index = x + (y * cam.resolution.x);
         PathSegment& segment = pathSegments[index];
-        thrust::default_random_engine rng = makeSeededRandomEngine(iter, segment.pixelIndex, segment.remainingBounces);
+        thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, traceDepth);
         thrust::uniform_real_distribution<float> u01(-0.5, 0.5);
 
         segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // TODO: implement antialiasing by jittering the ray
+        // jitter ray for antialiasing
         segment.ray.direction = glm::normalize(cam.view
             - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
             - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng))
@@ -329,6 +384,10 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
+        // This variable will later keep track of whether a ray hit a reflective/refractive material
+        // in previous collision so we can toggle NEE. We start with true so that immediately hitting
+        // a light provides a full contribution and not a weighted MIS contribution.
+        segment.specularBounce = true;
     }
 }
 
@@ -359,6 +418,7 @@ __global__ void computeIntersections(
         glm::vec3 normal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
+        bool hit_outside = true;
         bool outside = true;
 
         glm::vec3 tmp_intersect;
@@ -382,6 +442,7 @@ __global__ void computeIntersections(
             {
                 glm::vec3 minInter;
                 glm::vec3 minNorm;
+                bool curOutside = true;
 
                 t = FLT_MAX;
 
@@ -427,12 +488,13 @@ __global__ void computeIntersections(
                             for (size_t tIdx = node.triangleStart; tIdx < node.triangleStart + node.triangleCount; ++tIdx)
                             {
                                 Triangle tri = triangles[tIdx];
-                                float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
+                                float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, curOutside);
                                 if (curt < t && curt > 0)
                                 {
                                     t = curt;
                                     tmp_intersect = minInter;
                                     tmp_normal = minNorm;
+                                    outside = curOutside;
                                 }
                             }
                         }
@@ -449,12 +511,13 @@ __global__ void computeIntersections(
                 {
                     for (size_t tIdx = geom.triangleStart; tIdx < geom.triangleStart + geom.triangleCount; ++tIdx) {
                         Triangle tri = triangles[tIdx];
-                        float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, outside);
+                        float curt = triangleIntersectionTest(geom, tri, pathSegment.ray, localRay, minInter, minNorm, curOutside);
                         if (curt < t && curt > 0)
                         {
                             t = curt;
                             tmp_intersect = minInter;
                             tmp_normal = minNorm;
+                            outside = curOutside;
                         }
                     }
                 }
@@ -467,6 +530,7 @@ __global__ void computeIntersections(
             {
                 t_min = t;
                 hit_geom_index = i;
+                hit_outside = outside;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
             }
@@ -481,7 +545,9 @@ __global__ void computeIntersections(
             // The ray hits something
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
+            intersections[path_index].outside = hit_outside;
             intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].geomId = hit_geom_index;
         }
     }
 }
@@ -618,6 +684,156 @@ __global__ void bvhDebugKernel(
     image[path.pixelIndex] += color;
 }
 
+// Every iteration, the first bounce collects albedo and normal.
+// This function adds to a running mean so we have an accurate albedo/normal
+// map to pass into the denoiser.
+// Misses count as 0.
+__global__ void denoiser_updateMeanAlbedoAndNorms(
+    int num_paths,
+    int iter,
+    const PathSegment* pathSegments,
+    const ShadeableIntersection* intersections,
+    const Material* materials,
+    glm::vec3* albedo,
+    glm::vec3* normal)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_paths) return;
+
+    int pixel = pathSegments[idx].pixelIndex;
+    glm::vec3 a(0.0f);
+    glm::vec3 n(0.0f);
+    if (intersections[idx].t > 0.0f)
+    {
+        a = materials[intersections[idx].materialId].color;
+        n = intersections[idx].surfaceNormal;
+    }
+    albedo[pixel] += (a - albedo[pixel]) / (float)iter;
+    normal[pixel] += (n - normal[pixel]) / (float)iter;
+}
+
+// world space surface area of a box light
+// used in another function for sampling random points on lights,
+// and finding light's sampling pdf (how likely we would
+// have hit a light using a BSDF
+__device__ float cubeLightArea(const Geom& light)
+{
+    glm::vec3 s = light.scale;
+    return 2.0f * (s.x * s.y + s.y * s.z + s.x * s.z);
+}
+
+// (NEE) uniformly sample a point and outward normal on a box
+__device__ void sampleCubeLight(const Geom& light, thrust::default_random_engine& rng,
+    glm::vec3& outPoint, glm::vec3& outNormal)
+{
+    glm::vec3 s = light.scale;
+    // areas of each face (only 3 areas, since there are 3 pairs of faces with the same area)
+    float ax = s.y * s.z, ay = s.x * s.z, az = s.x * s.y;  // area of the x-, y-, z-facing pair (each face)
+    // total surface area
+    float total = 2.0f * (ax + ay + az);
+
+    thrust::uniform_real_distribution<float> u01(0, 1);
+    float pick = u01(rng) * total;
+
+    // random point in unit cube
+    glm::vec3 p(u01(rng) - 0.5f, u01(rng) - 0.5f, u01(rng) - 0.5f);
+    glm::vec3 n;
+    // determine which side pair the point is on,
+    // then clamp the random unit cube point to the surface
+    if (pick < 2.0f * ax)
+    {
+        p.x = (pick < ax) ? -0.5f : 0.5f;
+        n = glm::vec3(p.x > 0.0f ? 1.0f : -1.0f, 0.0f, 0.0f);
+    }
+    else if (pick < 2.0f * ax + 2.0f * ay)
+    {
+        p.y = ((pick - 2.0f * ax) < ay) ? -0.5f : 0.5f;
+        n = glm::vec3(0.0f, p.y > 0.0f ? 1.0f : -1.0f, 0.0f);
+    }
+    else
+    {
+        p.z = ((pick - 2.0f * ax - 2.0f * ay) < az) ? -0.5f : 0.5f;
+        n = glm::vec3(0.0f, 0.0f, p.z > 0.0f ? 1.0f : -1.0f);
+    }
+
+    // transform unit cube point and normal to world space point on light
+    outPoint = multiplyMV(light.transform, glm::vec4(p, 1.0f));
+    outNormal = glm::normalize(multiplyMV(light.invTranspose, glm::vec4(n, 0.0f)));
+}
+
+// NEE: check if anything closer than maxDist is blocking Ray r.
+// Uses similar logic to computeIntersections, but only returns a bool.
+__device__ bool sceneOccluded(
+    Ray r, float maxDist,
+    Geom* geoms, int geoms_size,
+    Triangle* triangles, BVHNode* bvhNodes, bool useBVH)
+{
+    for (int i = 0; i < geoms_size; i++)
+    {
+        Geom& geom = geoms[i];
+        glm::vec3 tmpIntersect, tmpNormal;
+        bool tmpOutside;
+
+        if (geom.type == CUBE)
+        {
+            float t = boxIntersectionTest(geom, r, tmpIntersect, tmpNormal, tmpOutside);
+            if (t > 1e-4f && t < maxDist - 1e-3f) return true;
+        }
+        else if (geom.type == SPHERE)
+        {
+            float t = sphereIntersectionTest(geom, r, tmpIntersect, tmpNormal, tmpOutside);
+            if (t > 1e-4f && t < maxDist - 1e-3f) return true;
+        }
+        else if (geom.type == MESH)
+        {
+            Ray localRay;
+            localRay.origin = multiplyMV(geom.inverseTransform, glm::vec4(r.origin, 1.0f));
+            localRay.direction = glm::normalize(multiplyMV(geom.inverseTransform, glm::vec4(r.direction, 0.0f)));
+
+            if (useBVH && geom.bvhRoot >= 0)
+            {
+                float toWorld = glm::length(multiplyMV(geom.transform, glm::vec4(localRay.direction, 0.0f)));
+                size_t stack[BVH_STACK_SIZE];
+                int stackPtr = 0;
+                stack[stackPtr++] = (size_t)geom.bvhRoot;
+                while (stackPtr > 0)
+                {
+                    size_t nodeIdx = stack[--stackPtr];
+                    BVHNode node = bvhNodes[nodeIdx];
+
+                    float tNear;
+                    if (!aabbIntersectionTest(node.boundsMin, node.boundsMax, localRay, tNear)) continue;
+                    // box is farther than the point we're testing
+                    if (tNear * toWorld > maxDist) continue;
+
+                    if (node.triangleCount > 0)
+                    {
+                        for (size_t tIdx = node.triangleStart; tIdx < node.triangleStart + node.triangleCount; ++tIdx)
+                        {
+                            float curt = triangleIntersectionTest(geom, triangles[tIdx], r, localRay, tmpIntersect, tmpNormal, tmpOutside);
+                            if (curt > 1e-4f && curt < maxDist - 1e-3f) return true;
+                        }
+                    }
+                    else
+                    {
+                        stack[stackPtr++] = node.leftChild;
+                        stack[stackPtr++] = node.rightChild;
+                    }
+                }
+            }
+            else
+            {
+                for (size_t tIdx = geom.triangleStart; tIdx < geom.triangleStart + geom.triangleCount; ++tIdx)
+                {
+                    float curt = triangleIntersectionTest(geom, triangles[tIdx], r, localRay, tmpIntersect, tmpNormal, tmpOutside);
+                    if (curt > 1e-4f && curt < maxDist - 1e-3f) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // LOOK: "fake" shader demonstrating what you might do with the info in
 // a ShadeableIntersection, as well as how to use thrust's random number
 // generator. Observe that since the thrust random number generator basically
@@ -633,7 +849,14 @@ __global__ void shadeFakeMaterial(
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
     Material* materials,
-    glm::vec3* image)
+    glm::vec3* image,
+    Geom* geoms,
+    int geoms_size,
+    Triangle* triangles,
+    BVHNode* bvhNodes,
+    bool useBVH,
+    int* lightGeomIndices,
+    int numLights)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths)
@@ -653,10 +876,35 @@ __global__ void shadeFakeMaterial(
 
             // If the material indicates that the object was a light, "light" the ray
             if (material.emittance > 0.0f) {
-                pathSegments[idx].color *= (materialColor * material.emittance);
+
+                glm::vec3 contribution = pathSegments[idx].color * (materialColor * material.emittance);
+
+                // MIS + NEE: this ray found the light by BSDF sampling. 
+                // If it left a diffuse surface, the else branch below already sampled some light,
+                // so we need to use power heuristic to weight light contribution.
+                if (!pathSegments[idx].specularBounce && numLights > 0)
+                {
+                    float dist2 = intersection.t * intersection.t;
+                    float cosLight = glm::max(glm::dot(-glm::normalize(pathSegments[idx].ray.direction), intersection.surfaceNormal), 0.0f);
+                    if (cosLight > 0.0f)
+                    {
+                        // likelihood of picking this light compared to others
+                        float pdfLightArea = 1.0f / (cubeLightArea(geoms[intersection.geomId]) * numLights);
+
+                        // likelihood of picking the light sampled direction (convert area pdf to solid angle)
+                        float pdfLightSA = pdfLightArea * dist2 / cosLight;
+                        float bsdfPdf = pathSegments[idx].bsdfPdf;
+
+                        // power heuristic (beta = 2)
+                        float misWeight = (bsdfPdf * bsdfPdf) / (bsdfPdf * bsdfPdf + pdfLightSA * pdfLightSA + 1e-9f);
+                        contribution *= misWeight;
+                    }
+                }
+
+                pathSegments[idx].color = contribution;
                 pathSegments[idx].remainingBounces = 0;
                 // Will need to be changed once there is more than one path per pixel.
-                image[pathSegments[idx].pixelIndex] += pathSegments[idx].color;
+                image[pathSegments[idx].pixelIndex] += contribution;
             }
             // Otherwise, do some pseudo-lighting computation. This is actually more
             // like what you would expect from shading in a rasterizer like OpenGL.
@@ -664,12 +912,83 @@ __global__ void shadeFakeMaterial(
             else {
                 //pathSegments[idx].color *= (materialColor * lightTerm) * 0.3f + ((1.0f - intersection.t * 0.02f) * materialColor) * 0.7f;
                 //pathSegments[idx].color *= u01(rng); // apply some noise because why not
+
+                bool isDelta = (material.hasReflective > 0.0f || material.hasRefractive > 0.0f);
+
+                // MIS + NEE: when we are not currently hitting a specular or refractive material (isDelta),
+                // we do our NEE logic where we find the power heuristic and use it to scale a 
+                // contribution directly from a random light that we sample from.
+                // Just as a note, we don't do this on reflective surfaces because the BSDF is a lot more
+                // narrow, so the BSDF's value at the direction toward the randomly sampled light point
+                // would be zero, so tracing the shadow ray is a waste.
+                if (!isDelta && numLights > 0)
+                {
+                    glm::vec3 hitPoint = getPointOnRay(pathSegments[idx].ray, intersection.t);
+
+                    // random light
+                    int lightIdx = lightGeomIndices[(int)(u01(rng) * numLights) % numLights];
+                    Geom light = geoms[lightIdx];
+                    Material lightMat = materials[light.materialid];
+
+                    // random light point and normal
+                    glm::vec3 lp, ln;
+                    sampleCubeLight(light, rng, lp, ln);
+
+                    // init factor for light area pdf
+                    float pdfLightArea = 1.0f / (cubeLightArea(light) * numLights);
+
+                    glm::vec3 toLight = lp - hitPoint;
+                    float dist2 = glm::dot(toLight, toLight);
+
+                    // wi = normalized toLight
+                    float dist = sqrtf(dist2);
+                    glm::vec3 wi = toLight / dist;
+
+                    // BSDF and light cos of angle at the normal
+                    float cosSurf = glm::max(glm::dot(intersection.surfaceNormal, wi), 0.0f);
+                    float cosLight = glm::max(glm::dot(ln, -wi), 0.0f);
+
+                    // avoid dividing by zero,
+                    // and negative values wouldn't physically make sense.
+                    if (cosSurf > 0.0f && cosLight > 0.0f)
+                    {
+                        // convert to solid angle pdf
+                        float pdfLightSA = pdfLightArea * dist2 / cosLight;
+
+                        Ray shadowRay;
+                        shadowRay.origin = hitPoint + intersection.surfaceNormal * 0.0001f;
+                        shadowRay.direction = wi;
+
+                        // check if shadowray is blocked
+                        if (!sceneOccluded(shadowRay, dist - 0.001f, geoms, geoms_size, triangles, bvhNodes, useBVH))
+                        {   
+                            // cosine-hemisphere pdf (same as calculateRandomDirectionInHemisphere)
+                            float bsdfPdfSA = cosSurf / PI;  
+                            // power heuristic (beta = 2)
+                            float misWeight = (pdfLightSA * pdfLightSA) / (pdfLightSA * pdfLightSA + bsdfPdfSA * bsdfPdfSA);
+                            // Lambertian BRDF
+                            glm::vec3 f = materialColor / PI;
+                            
+                            image[pathSegments[idx].pixelIndex] +=
+                                pathSegments[idx].color * f * cosSurf * (lightMat.color * lightMat.emittance) / pdfLightSA * misWeight;
+                        }
+                    }
+                }
+
                 scatterRay(
-                    pathSegments[idx], 
-                    getPointOnRay(pathSegments[idx].ray, intersection.t), 
-                    intersection.surfaceNormal, material, rng
+                    pathSegments[idx],
+                    pathSegments[idx].ray.origin + intersection.t * glm::normalize(pathSegments[idx].ray.direction),
+                    intersection.surfaceNormal, material, rng, intersection.outside
                 );
-                // A path that runs out of bounces without reaching a light adds nothing.
+
+                pathSegments[idx].specularBounce = isDelta;
+                if (!isDelta)
+                {
+                    // record bsdfpdf for later use if we hit a light (only needed if we didn't hit a delta surface)
+                    float cosTheta = glm::max(glm::dot(intersection.surfaceNormal, pathSegments[idx].ray.direction), 0.0f);
+                    pathSegments[idx].bsdfPdf = cosTheta / PI;
+                }
+                // A path that runs out of bounces without reaching a light adds nothing further.
             }
             // If there was no intersection, color the ray black.
             // Lots of renderers use 4 channel color, RGBA, where A = alpha, often
@@ -677,6 +996,7 @@ __global__ void shadeFakeMaterial(
             // This can be useful for post-processing and image compositing.
         }
         else {
+            image[pathSegments[idx].pixelIndex] += pathSegments[idx].color * BACKGROUND_COLOR;
             pathSegments[idx].color = glm::vec3(0.0f);
             pathSegments[idx].remainingBounces = 0;
         }
@@ -747,6 +1067,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const bool useBVH = guiData ? guiData->useBVH : true;
     const bool sortByMaterial = guiData ? guiData->sortByMaterial : true;
     const bool visualizeBVH = guiData ? guiData->visualizeBVH : false;
+    const bool useMIS = guiData ? guiData->useMIS : true;
+    const int activeLights = useMIS ? numLights : 0;
 
     if (evStart) cudaEventRecord(evStart);
 
@@ -794,6 +1116,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         cudaDeviceSynchronize();
         depth++;
 
+        // On the first intersection we record albedo and normal maps to update our textures to pass into the denoiser.
+        // The albedo and normal textures passed into the denosier are averages of the first intersection data.
+        if (depth == 1)
+        {
+            denoiser_updateMeanAlbedoAndNorms<<<numblocksPathSegmentTracing, blockSize1d>>>(
+                num_paths, iter, dev_paths, dev_intersections, dev_materials, dev_albedo, dev_normal);
+        }
+
         if (sortByMaterial && depth >= SORT_MIN_DEPTH && num_paths >= SORT_MIN_PATHS)
         {
             sortPathsByMaterial(num_paths, blockSize1d);
@@ -814,7 +1144,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_intersections,
             dev_paths,
             dev_materials,
-            dev_image
+            dev_image,
+            dev_geoms,
+            (int)hst_scene->geoms.size(),
+            dev_triangles,
+            dev_bvhNodes,
+            useBVH,
+            dev_lightGeomIndices,
+            activeLights
         );
 
         // in dev_paths: remove_if path has terminated
@@ -837,8 +1174,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     ///////////////////////////////////////////////////////////////////////////
 
+    glm::vec3* displayImage = dev_image;
+    showingDenoised = false;
+    // If denoise toggle is on and supported, get normalized image, run denoiser, then de-normalize image so we can keep rendering.
+    if (guiData && guiData->denoise && !visualizeBVH && denoiserAvailable())
+    {
+        const int scaleBlocks = (pixelcount + blockSize1d - 1) / blockSize1d;
+        scaleImage<<<scaleBlocks, blockSize1d>>>(pixelcount, dev_image, dev_denoise, 1.0f / iter);
+        denoiserRun();
+        scaleImage<<<scaleBlocks, blockSize1d>>>(pixelcount, dev_denoise, dev_denoise, (float)iter);
+        displayImage = dev_denoise;
+        showingDenoised = true;
+    }
+
     // Send results to OpenGL buffer for rendering
-    sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
+    sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, displayImage);
 
     checkCUDAError("pathtrace");
 

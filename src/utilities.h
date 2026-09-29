@@ -27,6 +27,8 @@ public:
     bool visualizeBVH = false;
     int bvhVizMode = 0;          // 0 = leaf colors, 1 = traversal heat map
     bool bvhOutlines = true;
+    bool denoise = false;        // Intel Open Image Denoise (only if found at build time)
+    bool useMIS = true;          // explicit light sampling (NEE) + MIS weighting
 
     float iterationMs = 0.0f;
 };

@@ -62,6 +62,9 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             const auto& col = p["RGB"];
             newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            newMaterial.hasReflective = p.value("REFLECTIVE", 1.0f);
+            newMaterial.hasRefractive = p.value("REFRACTIVE", 0.0f);
+            newMaterial.indexOfRefraction = p.value("IOR", 1.5f);
         }
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
@@ -132,6 +135,16 @@ void Scene::loadFromJSON(const std::string& jsonName)
 
         geoms.push_back(newGeom);
     }
+
+    // record which geoms are lights for NEE
+    for (int i = 0; i < (int)geoms.size(); ++i)
+    {
+        if (materials[geoms[i].materialid].emittance > 0.0f)
+        {
+            lightGeomIndices.push_back(i);
+        }
+    }
+
     const auto& cameraData = data["Camera"];
     Camera& camera = state.camera;
     RenderState& state = this->state;
