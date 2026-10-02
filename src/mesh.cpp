@@ -19,6 +19,28 @@ namespace
         return glm::vec3(p[0], p[1], p[2]);
     }
 
+    // Input vertex idx, return UV coord
+    glm::vec2 readUV(const tg3_model* model, const tg3_accessor& accessor, uint32_t index)
+    {
+        // Access UV info 
+        const uint8_t* p = accessorElementPtr(model, accessor, index);
+        switch (accessor.component_type)
+        {
+            case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:  return glm::vec2(p[0], p[1]) / 255.0f;
+            case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+            {
+                const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+                return glm::vec2(q[0], q[1]) / 65535.0f;
+            }
+            // FLOAT
+            default:
+            {
+                const float* q = reinterpret_cast<const float*>(p);
+                return glm::vec2(q[0], q[1]);
+            }
+        }
+    }
+
     uint32_t readIndex(const tg3_model* model, const tg3_accessor& accessor, uint32_t index)
     {
         const uint8_t* p = accessorElementPtr(model, accessor, index);
@@ -44,11 +66,19 @@ namespace
     }
 }
 
-bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTriangles)
+bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTriangles, bool& outHasUVs)
 {
+    outHasUVs = false;
     tinygltf3::Model model;
     tinygltf3::ErrorStack errors;
-    tg3_error_code err = tinygltf3::parse_file(model, errors, filepath.c_str());
+    tg3_parse_options options;
+    tg3_parse_options_init(&options);
+    // Most of the Flotsam balloon scene is not very dense, but the splash in front of the screen
+    // has around 17 million triangles (could have gotten away with 4 million, but the low poly was really noticable when it
+    // was lower)
+    // Thus, we increase our memory budget up to 16 GB, so RAM/VRAM becomes the limiting factor.
+    options.memory.memory_budget = 16ULL << 30;
+    tg3_error_code err = tinygltf3::parse_file(model, errors, filepath.c_str(), &options);
     if (err != TG3_OK)
     {
         std::cout << errors.count() << " error(s) loading " << filepath << ":" << std::endl;
@@ -84,6 +114,10 @@ bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTr
             int32_t normIdx = findAttribute(primitive, "NORMAL");
             const tg3_accessor* normAccessor = (normIdx >= 0) ? &model->accessors[normIdx] : nullptr;
 
+            int32_t uvIdx = findAttribute(primitive, "TEXCOORD_0");
+            const tg3_accessor* uvAccessor = (uvIdx >= 0) ? &model->accessors[uvIdx] : nullptr;
+            if (uvAccessor) outHasUVs = true;
+
             if (primitive.indices < 0)
             {
                 // If we don't have an index for a vertex, we don't load it 
@@ -91,6 +125,9 @@ bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTr
                 continue;
             }
             const tg3_accessor& idxAccessor = model->accessors[primitive.indices];
+            // We reserve size beforehand because we could be loading a massive file,
+            // and resizing is expensive
+            outTriangles.reserve(outTriangles.size() + idxAccessor.count / 3);
 
             for (uint64_t i = 0; i + 2 < idxAccessor.count; i += 3)
             {
@@ -113,6 +150,17 @@ bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTr
                 {
                     glm::vec3 faceNormal = glm::normalize(glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
                     tri.n0 = tri.n1 = tri.n2 = faceNormal;
+                }
+
+                if (uvAccessor)
+                {
+                    tri.uv0 = readUV(model.get(), *uvAccessor, i0);
+                    tri.uv1 = readUV(model.get(), *uvAccessor, i1);
+                    tri.uv2 = readUV(model.get(), *uvAccessor, i2);
+                }
+                else
+                {
+                    tri.uv0 = tri.uv1 = tri.uv2 = glm::vec2(0.0f);
                 }
 
                 outTriangles.push_back(tri);

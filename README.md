@@ -3,7 +3,7 @@ CUDA Path Tracer
 
 **University of Pennsylvania, CIS 565: GPU Programming and Architecture, Project 3**
 
-![BVH heatmap of the stanford bunny](img/heatmap.png)
+![A glamorous render of the pufferfish balloon from the illustrated book 'Flotsam' by David Wiesner](img/FlotsamBalloon.2026-10-02_03-00-39z.50samp.png)
 
 * Stephen Gavin Sears
   * [LinkedIn](https://www.linkedin.com/in/gavin-sears-536a1b285), [personal website](https://gavin-sears.github.io/sgavinsears/index.html)
@@ -20,11 +20,9 @@ Simple diffuse materials, emissiveness, material sorting, and stream compaction.
 
 ### Material Sorting
 
-*Performance analysis coming soon*
-
 ### Stream Compaction
 
-*Performance analysis coming soon*
+### Stochastic Antialiasing
 
 Extra Features
 ================
@@ -113,6 +111,31 @@ I think the biggest optimization I could add to this BVH implementation would be
 ### MIS + NEE
 
 *Performance analysis/visual comparison coming soon*
+
+### Microfacet Materials (GGX)
+
+*Visual comparison coming soon*
+
+### HDRI Environment Lighting
+
+
+*Visual comparison coming soon*
+
+### Physically Based Depth of Field
+
+*Performance Visual comparison coming soon*
+
+### Texture and Bump Mapping
+
+*Visual comparison coming soon*
+
+### sRGB Color Correction
+
+*Visual comparison coming soon*
+
+### Hiding Lights in Refractive Materials
+
+*Visual comparison coming soon*
 
 ### UI customization
 

@@ -85,6 +85,7 @@ static float dtheta = 0, dphi = 0;
 static glm::vec3 cammove;
 
 float zoom, theta, phi;
+float roll = 0.0f;
 glm::vec3 cameraPosition;
 glm::vec3 ogLookAt; // for recentering the camera
 
@@ -363,6 +364,7 @@ void RenderImGui()
         ImGui::TextColored(ImVec4(0.8f, 0.1f, 0.1f, 1.0f), "BVH off: big meshes take many seconds per iteration");
     }
     ImGui::Checkbox("Sort paths by material", &imguiData->sortByMaterial);
+    ImGui::Checkbox("Stream compaction", &imguiData->streamCompaction);
     if (ImGui::Checkbox("MIS + NEE (light sampling)", &imguiData->useMIS))
     {
         camchanged = true;
@@ -375,6 +377,7 @@ void RenderImGui()
     {
         ImGui::TextDisabled("Denoiser unavailable (OIDN not found)");
     }
+    ImGui::Checkbox("sRGB output (display gamma)", &imguiData->srgbOutput);
     if (ImGui::Checkbox("Visualize BVH", &imguiData->visualizeBVH))
     {
         camchanged = true;
@@ -385,6 +388,29 @@ void RenderImGui()
         ImGui::SameLine();
         if (ImGui::RadioButton("Traversal heat map", &imguiData->bvhVizMode, 1)) camchanged = true;
         if (ImGui::Checkbox("Outline boxes", &imguiData->bvhOutlines)) camchanged = true;
+    }
+
+    ImGui::Separator();
+    if (ImGui::Checkbox("Physically based DOF", &imguiData->useDOF))
+    {
+        camchanged = true;
+    }
+    if (imguiData->useDOF)
+    {
+        // We want more options in low ranges, like 0.5-8 for fstop, so log slider works best.
+        static const float focusMax = std::fmax(100.0f, 10.0f * imguiData->focusDistance);
+        const Camera& dofCam = renderState->camera;
+        if (ImGui::SliderFloat("f-stop", &imguiData->fstop, 0.5f, 32.0f, "f/%.1f", ImGuiSliderFlags_Logarithmic))
+        {
+            camchanged = true;
+        }
+        if (ImGui::SliderFloat("Focus distance", &imguiData->focusDistance, 0.01f, focusMax, "%.2f", ImGuiSliderFlags_Logarithmic))
+        {
+            camchanged = true;
+        }
+        // Update with lens diameter and focalLength for convenience
+        ImGui::Text("%.1f mm lens (from FOV), aperture radius %.4f units",
+            dofCam.focalLengthMm, dofCam.focalLength / (2.0f * imguiData->fstop));
     }
     ImGui::Separator();
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
@@ -459,6 +485,11 @@ int main(int argc, char** argv)
     //Create Instance for ImGUIData
     guiData = new GuiDataContainer();
 
+    // arguments for collecting performance metrics
+    if (const char* e = std::getenv("PT_SORT")) guiData->sortByMaterial = std::atoi(e) != 0;
+    if (const char* e = std::getenv("PT_COMPACT")) guiData->streamCompaction = std::atoi(e) != 0;
+    if (const char* e = std::getenv("PT_BVH")) guiData->useBVH = std::atoi(e) != 0;
+
     // Set up camera stuff from loaded path tracer settings
     iteration = 0;
     renderState = &scene->state;
@@ -473,14 +504,31 @@ int main(int argc, char** argv)
 
     cameraPosition = cam.position;
 
-    // compute phi (horizontal) and theta (vertical) relative 3D axis
-    // so, (0 0 1) is forward, (0 1 0) is up
-    glm::vec3 viewXZ = glm::vec3(view.x, 0.0f, view.z);
-    glm::vec3 viewZY = glm::vec3(0.0f, view.y, view.z);
-    phi = glm::acos(glm::dot(glm::normalize(viewXZ), glm::vec3(0, 0, -1)));
-    theta = glm::acos(glm::dot(glm::normalize(viewZY), glm::vec3(0, 1, 0)));
+    // Made some fixes because camera angles were flipped
+    phi = atan2f(-view.x, -view.z);
+    theta = acosf(glm::clamp(-view.y, -1.0f, 1.0f));
+    theta = glm::clamp(theta, 0.001f, PI - 0.001f);
+
+    // Scope block for applying roll
+    {
+        glm::vec3 levelRight = glm::normalize(glm::cross(view, glm::vec3(0, 1, 0)));
+        glm::vec3 levelUp = glm::cross(levelRight, view);
+        // project camera up onto the plane perp to view vector.
+        // This way up vector in scene file doesn't need to be orthogonal
+        glm::vec3 sceneUp = cam.up - view * glm::dot(cam.up, view);
+        // as long as this component is nonzero, and levelRight isn't NaN, we can use it and set the roll
+        if (glm::dot(sceneUp, sceneUp) > 1e-12f && glm::all(glm::equal(levelRight, levelRight)))
+        {
+            sceneUp = glm::normalize(sceneUp);
+            roll = atan2f(glm::dot(glm::cross(levelUp, sceneUp), view), glm::dot(levelUp, sceneUp));
+        }
+    }
     ogLookAt = cam.lookAt;
     zoom = glm::length(cam.position - ogLookAt);
+
+    guiData->useDOF = cam.fstop > 0.0f;
+    guiData->fstop = cam.fstop > 0.0f ? cam.fstop : 2.8f;
+    guiData->focusDistance = cam.focalDistance;
 
     // Initialize CUDA and GL components
     init();
@@ -509,7 +557,9 @@ void saveImage()
         {
             int index = x + (y * width);
             glm::vec3 pix = renderState->image[index];
-            img.setPixel(width - 1 - x, y, glm::vec3(pix) / samples);
+            glm::vec3 color = glm::vec3(pix) / samples;
+            if (imguiData->srgbOutput && !imguiData->visualizeBVH) color = linearToSRGB(color);
+            img.setPixel(width - 1 - x, y, color);
         }
     }
 
@@ -525,7 +575,6 @@ void saveImage()
     ss << filename << "." << startTimeString << "." << samples << "samp";
     filename = ss.str();
 
-    // CHECKITOUT
     img.savePNG(filename);
     //img.saveHDR(filename);  // Save a Radiance HDR file
 }
@@ -549,13 +598,18 @@ void runCuda()
         cam.view = -glm::normalize(cameraPosition);
         glm::vec3 v = cam.view;
         glm::vec3 u = glm::vec3(0, 1, 0);//glm::normalize(cam.up);
-        glm::vec3 r = glm::cross(v, u);
-        cam.up = glm::cross(r, v);
-        cam.right = r;
+        glm::vec3 r = glm::normalize(glm::cross(v, u));
+        glm::vec3 levelUp = glm::cross(r, v);
+        float cr = cos(roll), sr = sin(roll);
+        cam.right = cr * r + sr * glm::cross(v, r);
+        cam.up = cr * levelUp + sr * glm::cross(v, levelUp);
 
         cam.position = cameraPosition;
         cameraPosition += cam.lookAt;
         cam.position = cameraPosition;
+
+        cam.focalDistance = imguiData->focusDistance;
+        cam.lensRadius = imguiData->useDOF ? cam.focalLength / (2.0f * imguiData->fstop) : 0.0f;
         camchanged = false;
     }
 
@@ -595,6 +649,7 @@ void runCuda()
     else
     {
         saveImage();
+        if (std::getenv("PT_STATS")) pathtracePrintStats();
         pathtraceFree();
         cudaDeviceReset();
         exit(EXIT_SUCCESS);

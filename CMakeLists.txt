@@ -72,6 +72,12 @@ set(headers
     external/include/tinygltf_json_c.h
     src/bvh.h
     src/denoise.h
+    src/hdri.h
+    external/include/tinyexr.h
+    external/include/exr_reader.hh
+    external/include/streamreader.hh
+    external/include/miniz.h
+    src/texturing.h
 )
 
 set(sources
@@ -88,6 +94,9 @@ set(sources
     external/include/tiny_gltf_v3.c
     src/bvh.cpp
     src/denoise.cpp
+    src/hdri.cpp
+    external/include/miniz.c
+    src/texturing.cu
 )
 
 set(imgui_headers

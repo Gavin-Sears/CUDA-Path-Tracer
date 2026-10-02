@@ -4,4 +4,4 @@
 #include <vector>
 #include "sceneStructs.h"
 
-bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTriangles);
+bool loadMeshTriangles(const std::string& filepath, std::vector<Triangle>& outTriangles, bool& outHasUVs);
