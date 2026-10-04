@@ -36,7 +36,6 @@
 	    "REFRACTIVE":1.0,
 	    "IOR":1.5
 	}
-
     },
     "Camera":
     {
@@ -44,11 +43,10 @@
         "FOVY":45.0,
         "ITERATIONS":5000,
         "DEPTH":32,
-        "FILE":"cornell",
+        "FILE":"bunnyCubeSphereShowcase",
         "EYE":[0.0,5.0,10.5],
         "LOOKAT":[0.0,5.0,0.0],
-        "UP":[0.0,1.0,0.0],
-	"METERS_PER_UNIT": 0.01
+        "UP":[0.0,1.0,0.0]
     },
     "Objects":
     [
@@ -95,11 +93,26 @@
             "SCALE":[0.01,10.0,10.0]
         },
         {
+            "TYPE":"cube",
+            "MATERIAL":"specular_white",
+            "TRANS":[3.3,1.8,-1.0],
+            "ROTAT":[0.0,35.0,45.0],
+            "SCALE":[1.6,1.6,1.6]
+        },
+        {
             "TYPE":"sphere",
-            "MATERIAL":"diffuse_white",
-            "TRANS":[-1.0,4.0,-1.0],
+            "MATERIAL":"specular_white",
+            "TRANS":[-3.25,1.8,-1.0],
             "ROTAT":[0.0,0.0,0.0],
-            "SCALE":[3.0,3.0,3.0]
+            "SCALE":[1.8,1.8,1.8]
+        },
+        {
+            "TYPE":"mesh",
+            "MATERIAL":"specular_white",
+            "TRANS":[0.1,1.0,-0.9631],
+            "ROTAT":[0.0,0.0,0.0],
+            "SCALE":[19.0,19.0,19.0],
+            "FILENAME":"meshes/stanford-bunny-retopo.gltf"
         }
     ]
 }
